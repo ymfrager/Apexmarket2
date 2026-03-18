@@ -1215,31 +1215,21 @@ canvas.spark {
 // ── LAYOUT UTILITIES (must be first) ─────────────────────────
 // Double rAF: waits for browser to complete layout of newly injected DOM
 function waitForLayout(){
-  return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(r)))));
+  return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
 }
 
 // Robust canvas size detection with full fallback chain
 function getCanvasSize(canvas, defaultW=500, defaultH=220){
   const parent=canvas.parentElement;
   let W=0, H=0;
-  // 1. Canvas own offsetWidth (most reliable after layout)
-  if(canvas.offsetWidth>20) W=canvas.offsetWidth;
-  if(canvas.offsetHeight>20) H=canvas.offsetHeight;
-  // 2. Parent bounding rect
-  if(!W||!H){
-    const rect=parent?.getBoundingClientRect();
-    if(rect?.width>20) W=W||rect.width;
-    if(rect?.height>20) H=H||rect.height;
-  }
-  // 3. Parent clientWidth
+  const rect=parent?.getBoundingClientRect();
+  if(rect?.width>20) W=rect.width;
+  if(rect?.height>20) H=rect.height;
   if(!W) W=parent?.clientWidth||0;
   if(!H) H=parent?.clientHeight||0;
-  // 4. Canvas style attribute
   if(!W) W=parseInt(canvas.style.width||'')||0;
   if(!H) H=parseInt(canvas.style.height||'')||0;
-  // 5. data-h attribute
   if(!H) H=parseInt(canvas.getAttribute('data-h')||'')||0;
-  // 6. Walk up DOM for width
   if(!W){
     let el=parent;
     while(el&&!W){ W=el.offsetWidth||0; el=el.parentElement; }
@@ -1287,8 +1277,8 @@ const CRYPTO_INFO = {
 
 // ── STATE ────────────────────────────────────────────
 let currentPage = localStorage.getItem('apex_page') || 'home';
-let ws = null; // WebSocket disabled — Netlify blocks wss:// to external origins
-let wsReconnectDelay = 1000; // unused but kept to avoid reference errors
+let ws = null;
+let wsReconnectDelay = 1000;
 const lastPrices = new Map();
 let portfolio = JSON.parse(localStorage.getItem('apex_portfolio') || '[]');
 let watchlists = JSON.parse(localStorage.getItem('apex_watchlists') || '{"Default":[]}');
@@ -1622,83 +1612,6 @@ async function fhGet(path, params={}, ttl=3600000) {
     console.error('[APEX fhGet] Exception:', e.message);
     return null;
   }
-}
-
-// ── FINNHUB-FIRST QUOTE ───────────────────────────────
-// Uses Finnhub when key present (CORS-safe), falls back to Yahoo Finance
-async function smartQuote(symbol) {
-  const fhKey = localStorage.getItem('apex_fh_key');
-  // Map Yahoo-style symbols to Finnhub format
-  const fhSym = symbol.startsWith('^') ? symbol.replace('^','') :
-                symbol.endsWith('-USD') ? 'BINANCE:'+symbol.replace('-USD','USDT') :
-                symbol.replace('=F','').replace('=','');
-  // Special cases
-  const fhSymMap = {
-    'SPY':'SPY','QQQ':'QQQ','DIA':'DIA','IWM':'IWM',
-    'BTC-USD':'BINANCE:BTCUSDT','ETH-USD':'BINANCE:ETHUSDT',
-    'SOL-USD':'BINANCE:SOLUSDT','BNB-USD':'BINANCE:BNBUSDT',
-    'XRP-USD':'BINANCE:XRPUSDT','DOGE-USD':'BINANCE:DOGEUSDT',
-    'GC=F':'OANDA:XAUUSD','CL=F':'OANDA:WTIUSD','SI=F':'OANDA:XAGUSD',
-    '^VIX':'VIX','^GSPC':'SPY','^NDX':'QQQ','^DJI':'DIA',
-    'BZ=F':'OANDA:BCOUSD','NG=F':'NYMEX:NG1!','HG=F':'COMEX:HG1!',
-    'PL=F':'NYMEX:PL1!','ZC=F':'CBOT:ZC1!','ZW=F':'CBOT:ZW1!',
-  };
-  const resolvedSym = fhSymMap[symbol] || (symbol.includes(':') ? symbol : symbol.toUpperCase());
-
-  if (fhKey) {
-    try {
-      const q = await fhGet('quote', {symbol: resolvedSym}, 15000);
-      if (q && q.c && q.c > 0) {
-        _usingDemoData = false;
-        document.getElementById('demo-data-badge')?.remove();
-        return { c:q.c, o:q.o||q.pc, pc:q.pc,
-                 d:q.d||0, dp:q.dp||0,
-                 h:q.h||q.c, l:q.l||q.c, v:0, mc:null };
-      }
-    } catch(_) {}
-  }
-  // Fallback to Yahoo Finance
-  return await yfQuote(symbol);
-}
-
-// ── FINNHUB-FIRST CANDLES ─────────────────────────────
-// Uses Finnhub stock/candle when key present, falls back to Yahoo/synth
-async function smartCandles(symbol, range='1mo', interval='1d') {
-  const fhKey = localStorage.getItem('apex_fh_key');
-  // Map to Finnhub symbol
-  const fhSymMap = {
-    'SPY':'SPY','QQQ':'QQQ','DIA':'DIA','IWM':'IWM',
-    'BTC-USD':'BINANCE:BTCUSDT','ETH-USD':'BINANCE:ETHUSDT',
-    'SOL-USD':'BINANCE:SOLUSDT','^VIX':'VIX',
-    'GC=F':'OANDA:XAUUSD','CL=F':'OANDA:WTIUSD',
-  };
-  const fhSym = fhSymMap[symbol] || symbol.replace('^','').replace('=F','').toUpperCase();
-
-  // Map range to Finnhub resolution and time window
-  const now = Math.floor(Date.now()/1000);
-  const rangeMap = {
-    '1d':  {res:'5',  from: now - 86400},
-    '5d':  {res:'15', from: now - 5*86400},
-    '1mo': {res:'D',  from: now - 30*86400},
-    '3mo': {res:'D',  from: now - 90*86400},
-    '6mo': {res:'D',  from: now - 180*86400},
-    '1y':  {res:'W',  from: now - 365*86400},
-    '5y':  {res:'M',  from: now - 5*365*86400},
-  };
-  const { res, from } = rangeMap[range] || rangeMap['1mo'];
-
-  if (fhKey) {
-    try {
-      const d = await fhGet('stock/candle', {symbol:fhSym, resolution:res, from, to:now}, 30000);
-      if (d && d.s === 'ok' && d.c && d.c.length > 1) {
-        _usingDemoData = false;
-        document.getElementById('demo-data-badge')?.remove();
-        return { t:d.t, c:d.c, o:d.o||d.c, h:d.h||d.c, l:d.l||d.c, v:d.v||[], s:'ok' };
-      }
-    } catch(_) {}
-  }
-  // Fallback to Yahoo Finance / synthetic
-  return await yfCandles(symbol, range, interval);
 }
 
 function setApiDot(api,status){
@@ -2141,7 +2054,7 @@ async function loadCommodities(containerId) {
       </div>
     </div>`).join('');
   for(const c of commodities){
-    const q=await smartQuote(c.sym);
+    const q=await yfQuote(c.sym);
     const sid=c.sym.replace('=','');
     const pe=document.getElementById(`comm-p-${sid}`);
     const ce=document.getElementById(`comm-c-${sid}`);
@@ -2166,7 +2079,7 @@ async function loadCryptoStats(containerId){
   el.innerHTML=rows.map(r=>`<div class="stat-row"><span class="sl">${r.label}</span><span class="sv" id="${r.id}">${skeletonEl('70px','16px')}</span></div>`).join('');
   // Fetch top coins for better dominance estimate
   const topSyms=['BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD','DOGE-USD','ADA-USD','AVAX-USD','LINK-USD','DOT-USD'];
-  const quotes=await Promise.all(topSyms.map(s=>smartQuote(s).then(q=>({s,q}))));
+  const quotes=await Promise.all(topSyms.map(s=>yfQuote(s).then(q=>({s,q}))));
   const btcData=quotes.find(x=>x.s==='BTC-USD');
   const btc=btcData?.q;
   const ethData=quotes.find(x=>x.s==='ETH-USD');
@@ -2216,7 +2129,7 @@ async function loadGlobalMarkets(containerId){
   </div>`).join('');
   for(const idx of indices){
     const sid=idx.sym.replace(/[\^.]/g,'');
-    const q=await smartQuote(idx.sym);
+    const q=await yfQuote(idx.sym);
     const pe=document.getElementById(`gm-p-${sid}`);
     const ce=document.getElementById(`gm-c-${sid}`);
     if(pe){pe.innerHTML=q?.c?`<span class="f-mono">${fmtPrice(q.c,0)}</span>`:'<span style="color:var(--t4)">—</span>';}
@@ -2227,49 +2140,22 @@ async function loadGlobalMarkets(containerId){
   }
 }
 
-// ── LIVE PRICE POLLING (WebSocket replaced with REST polling) ──
-// Netlify blocks WebSocket upgrades to external domains (wss://ws.finnhub.io).
-// REST polling via setInterval gives the same live-price updates without WS.
+// ── WEBSOCKET (Fix 1.8) ──────────────────────────────
 let wsSubs=new Set();
-let _pollInterval=null;
-let _pollActive=false;
-
 function initWS(){
-  // WebSocket intentionally disabled — use REST polling instead
-  _startPricePolling();
+  const key=localStorage.getItem('apex_fh_key');if(!key)return;
+  if(ws){try{ws.close();}catch(e){}}
+  ws=new WebSocket(`wss://ws.finnhub.io?token=${key}`);
+  ws.onopen=()=>{document.getElementById('ws-status')?.classList.replace('ws-off','ws-on');wsSubs.forEach(s=>wsSend({type:'subscribe',symbol:s}));};
+  ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='trade'&&m.data)m.data.forEach(handleTrade);}catch(e){}};
+  ws.onclose=()=>{
+    document.getElementById('ws-status')?.classList.replace('ws-on','ws-off');
+    // Do NOT reset _fetchMethod — causes unnecessary proxy re-detection on every close
+    setTimeout(()=>{wsReconnectDelay=Math.min(wsReconnectDelay*2,30000);initWS();},wsReconnectDelay);
+  };
 }
-function wsSend(obj){ /* no-op */ }
-function wsSub(s){
-  wsSubs.add(s);
-  if(_pollActive) setTimeout(_pollOnce, 500);
-}
-
-async function _pollOnce(){
-  const key=localStorage.getItem('apex_fh_key');
-  if(!key||!wsSubs.size) return;
-  const syms=[...wsSubs].slice(0,8);
-  for(const s of syms){
-    try{
-      const url=new URL('https://finnhub.io/api/v1/quote');
-      url.searchParams.set('symbol',s);
-      url.searchParams.set('token',key);
-      const r=await fetch(url.toString(),{method:'GET',mode:'cors',credentials:'omit'});
-      if(!r.ok) continue;
-      const q=await r.json();
-      if(q&&q.c&&q.c>0) handleTrade({s,p:q.c});
-    }catch(e){}
-  }
-}
-
-function _startPricePolling(){
-  if(_pollActive) return;
-  const key=localStorage.getItem('apex_fh_key');
-  if(!key) return;
-  _pollActive=true;
-  document.getElementById('ws-status')?.classList.replace('ws-off','ws-on');
-  setTimeout(_pollOnce, 3000);
-  _pollInterval=setInterval(_pollOnce, 15000);
-}
+function wsSend(obj){try{ws?.readyState===1&&ws.send(JSON.stringify(obj));}catch(e){}}
+function wsSub(s){wsSubs.add(s);wsSend({type:'subscribe',symbol:s});}
 function handleTrade({s,p}){
   const prev=lastPrices.get(s);const dir=prev==null||p>=prev?'up':'dn';
   lastPrices.set(s,p);
@@ -2350,7 +2236,7 @@ async function buildTicker(){
     if(html&&inner)inner.innerHTML=html+html;
   };
   await Promise.allSettled(TICKER_SYMS.map((s,idx)=>
-    smartQuote(s).then(q=>{
+    yfQuote(s).then(q=>{
       if(!q?.c)return;
       tickItems[idx]=`<span class="tick" onclick="loadDDStock('${s}');showPage('deepdive')"><span class="sym">${s.replace('-USD','').replace('=F','')}</span><span>${fmtPrice(q.c,2)}</span><span class="chg ${pillCls(q.dp)}">${fmtPct(q.dp,1)}</span></span>`;
       if(!built){built=true;setTimeout(render,0);}
@@ -3277,7 +3163,7 @@ function switchMoversTab(tab,btn){
 async function loadIndexCards(){
   // Fetch all quotes in parallel for fast render
   const results = await Promise.allSettled(
-    INDEX_SYMS.map(s => smartQuote(s.yf||s.sym).then(q=>({s,q})))
+    INDEX_SYMS.map(s => yfQuote(s.yf||s.sym).then(q=>({s,q})))
   );
   for(const res of results){
     if(res.status!=='fulfilled'||!res.value?.q?.c) continue;
@@ -3297,7 +3183,7 @@ async function loadIndexCards(){
     const sc=document.getElementById('spark-'+(s.fh||s.sym));
     if(!sc)return;
     const q=results.find(r=>r.status==='fulfilled'&&r.value?.s===s)?.value?.q;
-    const data=await smartCandles(s.yf||s.sym,'5d','15m');
+    const data=await yfCandles(s.yf||s.sym,'5d','15m');
     if(data?.c?.length){
       await waitForLayout();
       drawSparkline(sc,data.c,(q?.dp||0)>=0);
@@ -3306,7 +3192,7 @@ async function loadIndexCards(){
 }
 
 async function loadFearGreed(){
-  const vixQ=await smartQuote('^VIX');if(!vixQ?.c)return;
+  const vixQ=await yfQuote('^VIX');if(!vixQ?.c)return;
   const vix=vixQ.c;
   // VIX → sentiment score: VIX 10=90, VIX 20=50, VIX 40=10
   const score=Math.max(5,Math.min(95,Math.round(100-(vix-10)*2.5)));
@@ -3327,7 +3213,7 @@ async function loadFearGreed(){
 }
 
 async function loadMarketBreadth(){
-  const spy=await smartQuote('SPY');if(!spy?.dp)return;
+  const spy=await yfQuote('SPY');if(!spy?.dp)return;
   // Fix 1.12: Estimate from SPY move, clearly labeled
   const total=500;
   const adv=Math.round(total*(0.5+spy.dp*0.04));
@@ -3559,10 +3445,10 @@ async function loadDDStock(sym){
   const inp=document.getElementById('dd-input');if(inp)inp.value=ddSym;
   const el=document.getElementById('dd-content');if(!el)return;
   el.innerHTML=`<div style="text-align:center;padding:40px;color:var(--t3)"><div style="width:28px;height:28px;border-radius:50%;border:3px solid var(--bg3);border-top-color:var(--mint);animation:spin 1s linear infinite;margin:0 auto 12px"></div>Loading ${ddSym}...</div>`;
-  const[q,prof,fin,recs,earns,news]=await Promise.all([smartQuote(ddSym),getProfile(ddSym),getFinancials(ddSym),getRecs(ddSym),getEarnings(ddSym),getNews(ddSym)]);
+  const[q,prof,fin,recs,earns,news]=await Promise.all([getQuote(ddSym),getProfile(ddSym),getFinancials(ddSym),getRecs(ddSym),getEarnings(ddSym),getNews(ddSym)]);
   if(!q?.c&&!prof?.name){
     // Try Yahoo Finance as fallback quote
-    const yfq=await smartQuote(ddSym);
+    const yfq=await yfQuote(ddSym);
     if(!yfq?.c){
       el.innerHTML=`<div class="empty"><div class="empty-icon">🔍</div><div style="font-size:13px">No data found for "${ddSym}".</div><div style="font-size:12px;color:var(--t3);margin-top:8px">Make sure you're using the ticker symbol (e.g. <strong>AAPL</strong> not "Apple").<br>Use the search box above and click a result from the dropdown.</div></div>`;
       return;
@@ -3642,7 +3528,7 @@ async function loadDDChart(tf,btn){
   loadCtx.font='12px "DM Sans",sans-serif';
   loadCtx.textAlign='center';
   loadCtx.fillText('Loading chart…',lW/2,130);
-  const data=await smartCandles(ddSym,range,interval);
+  const data=await yfCandles(ddSym,range,interval);
   // Double rAF ensures canvas has final layout dimensions
   await waitForLayout();
   // data is always non-null now (falls back to synthetic if network fails)
@@ -4023,7 +3909,7 @@ function renderWL(){
     <div class="f-mono" style="font-size:11px;color:var(--t3)" id="wlp-${s}">${skeletonEl('80px','12px')}</div></div>
     <button style="background:none;border:none;color:var(--t4);cursor:pointer;font-size:13px;padding:4px 8px" onclick="event.stopPropagation();removeWL('${s}')">✕</button>
   </div>`).join('');
-  syms.forEach(async s=>{const q=await smartQuote(s);const e=document.getElementById('wlp-'+s);if(e&&q?.c){e.textContent='$'+fmtPrice(q.c)+' '+fmtPct(q.dp);e.style.color=q.dp>=0?'var(--green)':'var(--rose)';}});
+  syms.forEach(async s=>{const q=await getQuote(s);const e=document.getElementById('wlp-'+s);if(e&&q?.c){e.textContent='$'+fmtPrice(q.c)+' '+fmtPct(q.dp);e.style.color=q.dp>=0?'var(--green)':'var(--rose)';}});
 }
 function switchWL(n,btn){
   activeWL=n;localStorage.setItem('apex_wl',n);
@@ -4357,7 +4243,7 @@ async function buildCrypto(el){
   `;
   const yfSymMap={BTC:'BTC-USD',ETH:'ETH-USD',SOL:'SOL-USD',BNB:'BNB-USD',XRP:'XRP-USD',DOGE:'DOGE-USD',ADA:'ADA-USD',AVAX:'AVAX-USD',LINK:'LINK-USD',DOT:'DOT-USD',LTC:'LTC-USD',UNI:'UNI-USD',ATOM:'ATOM-USD',XLM:'XLM-USD',SUI:'SUI-USD',NEAR:'NEAR-USD'};
   cryptoList.forEach(async([sym])=>{
-    const q=await smartQuote(yfSymMap[sym]||sym+'-USD');if(!q?.c)return;
+    const q=await yfQuote(yfSymMap[sym]||sym+'-USD');if(!q?.c)return;
     const pe=document.getElementById(`c-price-${sym}`);const ce=document.getElementById(`c-chg-${sym}`);
     if(pe)pe.textContent='$'+fmtPrice(q.c,q.c<1?6:q.c<100?4:2);
     if(ce){ce.textContent=fmtPct(q.dp);ce.className=`crypto-chg f-mono ${q.dp>=0?'t-green':'t-rose'}`;}
@@ -4375,7 +4261,7 @@ async function loadBTCChart(tf,btn){
   const c=document.getElementById('btc-chart');if(!c)return;
   const tfMap={'1D':['1d','5m'],'1W':['5d','1h'],'1M':['1mo','1d'],'1Y':['1y','1wk']};
   const[range,interval]=tfMap[tf]||['1d','5m'];
-  const data=await smartCandles('BTC-USD',range,interval);
+  const data=await yfCandles('BTC-USD',range,interval);
   c.style.height='200px';
   await waitForLayout();
   if(!data?.c?.length){
@@ -4390,7 +4276,7 @@ async function loadBTCChart(tf,btn){
 
 async function loadBTCSPYCorrelation(){
   const el=document.getElementById('btc-spy-corr');if(!el)return;
-  const[btcData,spyData]=await Promise.all([smartCandles('BTC-USD','1mo','1d'),smartCandles('SPY','1mo','1d')]);
+  const[btcData,spyData]=await Promise.all([yfCandles('BTC-USD','1mo','1d'),yfCandles('SPY','1mo','1d')]);
   if(!btcData?.c?.length||!spyData?.c?.length){el.textContent='—';return;}
   // Daily returns
   const btcRets=btcData.c.slice(1).map((v,i)=>(v-btcData.c[i])/btcData.c[i]);
@@ -4508,7 +4394,7 @@ async function runCompareChart(tf,btn){
   const c=document.getElementById('cmp-chart');if(!c)return;
   const tfMap={'1M':['1mo','1d'],'3M':['3mo','1d'],'6M':['6mo','1d'],'1Y':['1y','1wk'],'5Y':['5y','1mo']};
   const[range,interval]=tfMap[tf]||['1mo','1d'];
-  const allData=await Promise.allSettled(compareSyms.map(s=>smartCandles(s,range,interval).then(d=>({s,d}))));
+  const allData=await Promise.allSettled(compareSyms.map(s=>yfCandles(s,range,interval).then(d=>({s,d}))));
   const datasets=allData
     .filter(r=>r.status==='fulfilled'&&r.value?.d?.c?.length)
     .map(({value:{s,d}},i)=>({
