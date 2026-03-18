@@ -1215,26 +1215,21 @@ canvas.spark {
 // ── LAYOUT UTILITIES (must be first) ─────────────────────────
 // Double rAF: waits for browser to complete layout of newly injected DOM
 function waitForLayout(){
-  return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+  return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(r)))));
 }
-
-// Robust canvas size detection with full fallback chain
 function getCanvasSize(canvas, defaultW=500, defaultH=220){
   const parent=canvas.parentElement;
-  let W=0, H=0;
-  const rect=parent?.getBoundingClientRect();
-  if(rect?.width>20) W=rect.width;
-  if(rect?.height>20) H=rect.height;
+  let W=0,H=0;
+  if(canvas.offsetWidth>20) W=canvas.offsetWidth;
+  if(canvas.offsetHeight>20) H=canvas.offsetHeight;
+  if(!W||!H){const rect=parent?.getBoundingClientRect();if(rect?.width>20)W=W||rect.width;if(rect?.height>20)H=H||rect.height;}
   if(!W) W=parent?.clientWidth||0;
   if(!H) H=parent?.clientHeight||0;
   if(!W) W=parseInt(canvas.style.width||'')||0;
   if(!H) H=parseInt(canvas.style.height||'')||0;
   if(!H) H=parseInt(canvas.getAttribute('data-h')||'')||0;
-  if(!W){
-    let el=parent;
-    while(el&&!W){ W=el.offsetWidth||0; el=el.parentElement; }
-  }
-  return { W: W||defaultW, H: H||defaultH };
+  if(!W){let el=parent;while(el&&!W){W=el.offsetWidth||0;el=el.parentElement;}}
+  return{W:W||defaultW,H:H||defaultH};
 }
 
 // Fix 1.21: Real current date
@@ -1612,6 +1607,114 @@ async function fhGet(path, params={}, ttl=3600000) {
     console.error('[APEX fhGet] Exception:', e.message);
     return null;
   }
+}
+
+// ── FINNHUB-FIRST QUOTE ───────────────────────────────
+// Uses Finnhub when key present (CORS-safe), falls back to Yahoo Finance
+async function smartQuote(symbol) {
+  const fhKey = localStorage.getItem('apex_fh_key');
+  // Map Yahoo-style symbols to Finnhub format
+  const fhSym = symbol.startsWith('^') ? symbol.replace('^','') :
+                symbol.endsWith('-USD') ? 'BINANCE:'+symbol.replace('-USD','USDT') :
+                symbol.replace('=F','').replace('=','');
+  // Special cases
+  const fhSymMap = {
+    'SPY':'SPY','QQQ':'QQQ','DIA':'DIA','IWM':'IWM',
+    'BTC-USD':'BINANCE:BTCUSDT','ETH-USD':'BINANCE:ETHUSDT',
+    'SOL-USD':'BINANCE:SOLUSDT','BNB-USD':'BINANCE:BNBUSDT',
+    'XRP-USD':'BINANCE:XRPUSDT','DOGE-USD':'BINANCE:DOGEUSDT',
+    'GC=F':'OANDA:XAUUSD','CL=F':'OANDA:WTIUSD','SI=F':'OANDA:XAGUSD',
+    '^VIX':'VIX','^GSPC':'SPY','^NDX':'QQQ','^DJI':'DIA',
+    'BZ=F':'OANDA:BCOUSD','NG=F':'NYMEX:NG1!','HG=F':'COMEX:HG1!',
+    'PL=F':'NYMEX:PL1!','ZC=F':'CBOT:ZC1!','ZW=F':'CBOT:ZW1!',
+  };
+  const resolvedSym = fhSymMap[symbol] || (symbol.includes(':') ? symbol : symbol.toUpperCase());
+
+  if (fhKey) {
+    try {
+      const q = await fhGet('quote', {symbol: resolvedSym}, 15000);
+      if (q && q.c && q.c > 0) {
+        _usingDemoData = false;
+        document.getElementById('demo-data-badge')?.remove();
+        return { c:q.c, o:q.o||q.pc, pc:q.pc,
+                 d:q.d||0, dp:q.dp||0,
+                 h:q.h||q.c, l:q.l||q.c, v:0, mc:null };
+      }
+    } catch(_) {}
+  }
+  // Fallback to Yahoo Finance
+  return await yfQuote(symbol);
+}
+
+// ── TWELVE DATA — HISTORICAL CANDLES ─────────────────
+// Twelve Data free tier includes historical candles — exactly what Finnhub free lacks.
+const TD_KEY = '58eaf01b0d7041529bc5f3b8dbcab103';
+
+// Map internal symbols to Twelve Data format
+function _tdSymbol(symbol) {
+  const map = {
+    'BTC-USD':'BTC/USD','ETH-USD':'ETH/USD','SOL-USD':'SOL/USD',
+    'BNB-USD':'BNB/USD','XRP-USD':'XRP/USD','DOGE-USD':'DOGE/USD',
+    'ADA-USD':'ADA/USD','AVAX-USD':'AVAX/USD','LINK-USD':'LINK/USD',
+    'DOT-USD':'DOT/USD','LTC-USD':'LTC/USD','UNI-USD':'UNI/USD',
+    'GC=F':'XAU/USD','SI=F':'XAG/USD','CL=F':'WTI/USD','BZ=F':'BRENT/USD',
+    '^VIX':'VIX','^GSPC':'SPY','^NDX':'QQQ','^DJI':'DIA',
+  };
+  return map[symbol] || symbol.replace('^','').replace('=F','').replace('-USD','/USD').toUpperCase();
+}
+
+async function tdCandles(symbol, range='1mo') {
+  const ck = 'td:'+symbol+range;
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  // Map range to Twelve Data interval and outputsize
+  const rangeMap = {
+    '1d':  {interval:'5min',  outputsize:78},
+    '5d':  {interval:'15min', outputsize:130},
+    '1mo': {interval:'1day',  outputsize:30},
+    '3mo': {interval:'1day',  outputsize:90},
+    '6mo': {interval:'1day',  outputsize:180},
+    '1y':  {interval:'1week', outputsize:52},
+    '5y':  {interval:'1month',outputsize:60},
+  };
+  const { interval, outputsize } = rangeMap[range] || rangeMap['1mo'];
+  const tdSym = _tdSymbol(symbol);
+
+  try {
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(tdSym)}&interval=${interval}&outputsize=${outputsize}&apikey=${TD_KEY}`;
+    const r = await fetch(url, { method:'GET', mode:'cors' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (d.status === 'error' || !d.values?.length) throw new Error(d.message || 'no data');
+
+    // Twelve Data returns newest first — reverse to oldest first
+    const values = [...d.values].reverse();
+    const t = values.map(v => Math.floor(new Date(v.datetime).getTime() / 1000));
+    const c = values.map(v => parseFloat(v.close));
+    const o = values.map(v => parseFloat(v.open));
+    const h = values.map(v => parseFloat(v.high));
+    const l = values.map(v => parseFloat(v.low));
+    const v = values.map(v => parseInt(v.volume||0));
+
+    const result = { t, c, o, h, l, v, s:'ok' };
+    _usingDemoData = false;
+    document.getElementById('demo-data-badge')?.remove();
+    cacheSet(ck, result, 60000);
+    return result;
+  } catch(e) {
+    console.warn('[APEX tdCandles] failed for', symbol, e.message);
+    return null;
+  }
+}
+
+async function smartCandles(symbol, range='1mo', interval='1d') {
+  // 1. Try Twelve Data first (free tier has historical candles)
+  const td = await tdCandles(symbol, range);
+  if (td?.c?.length > 1) return td;
+
+  // 2. Fall back to Yahoo Finance / synthetic
+  return await yfCandles(symbol, range, interval);
 }
 
 function setApiDot(api,status){
@@ -2054,7 +2157,7 @@ async function loadCommodities(containerId) {
       </div>
     </div>`).join('');
   for(const c of commodities){
-    const q=await yfQuote(c.sym);
+    const q=await smartQuote(c.sym);
     const sid=c.sym.replace('=','');
     const pe=document.getElementById(`comm-p-${sid}`);
     const ce=document.getElementById(`comm-c-${sid}`);
@@ -2079,7 +2182,7 @@ async function loadCryptoStats(containerId){
   el.innerHTML=rows.map(r=>`<div class="stat-row"><span class="sl">${r.label}</span><span class="sv" id="${r.id}">${skeletonEl('70px','16px')}</span></div>`).join('');
   // Fetch top coins for better dominance estimate
   const topSyms=['BTC-USD','ETH-USD','SOL-USD','BNB-USD','XRP-USD','DOGE-USD','ADA-USD','AVAX-USD','LINK-USD','DOT-USD'];
-  const quotes=await Promise.all(topSyms.map(s=>yfQuote(s).then(q=>({s,q}))));
+  const quotes=await Promise.all(topSyms.map(s=>smartQuote(s).then(q=>({s,q}))));
   const btcData=quotes.find(x=>x.s==='BTC-USD');
   const btc=btcData?.q;
   const ethData=quotes.find(x=>x.s==='ETH-USD');
@@ -2129,7 +2232,7 @@ async function loadGlobalMarkets(containerId){
   </div>`).join('');
   for(const idx of indices){
     const sid=idx.sym.replace(/[\^.]/g,'');
-    const q=await yfQuote(idx.sym);
+    const q=await smartQuote(idx.sym);
     const pe=document.getElementById(`gm-p-${sid}`);
     const ce=document.getElementById(`gm-c-${sid}`);
     if(pe){pe.innerHTML=q?.c?`<span class="f-mono">${fmtPrice(q.c,0)}</span>`:'<span style="color:var(--t4)">—</span>';}
@@ -2140,22 +2243,37 @@ async function loadGlobalMarkets(containerId){
   }
 }
 
-// ── WEBSOCKET (Fix 1.8) ──────────────────────────────
+// ── LIVE PRICE POLLING (WebSocket disabled — Netlify/GitHub Pages block wss://) ──
 let wsSubs=new Set();
-function initWS(){
-  const key=localStorage.getItem('apex_fh_key');if(!key)return;
-  if(ws){try{ws.close();}catch(e){}}
-  ws=new WebSocket(`wss://ws.finnhub.io?token=${key}`);
-  ws.onopen=()=>{document.getElementById('ws-status')?.classList.replace('ws-off','ws-on');wsSubs.forEach(s=>wsSend({type:'subscribe',symbol:s}));};
-  ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='trade'&&m.data)m.data.forEach(handleTrade);}catch(e){}};
-  ws.onclose=()=>{
-    document.getElementById('ws-status')?.classList.replace('ws-on','ws-off');
-    // Do NOT reset _fetchMethod — causes unnecessary proxy re-detection on every close
-    setTimeout(()=>{wsReconnectDelay=Math.min(wsReconnectDelay*2,30000);initWS();},wsReconnectDelay);
-  };
+let _pollInterval=null;
+let _pollActive=false;
+function initWS(){ _startPricePolling(); }
+function wsSend(obj){}
+function wsSub(s){ wsSubs.add(s); if(_pollActive) setTimeout(_pollOnce,500); }
+async function _pollOnce(){
+  const key=localStorage.getItem('apex_fh_key');
+  if(!key||!wsSubs.size) return;
+  const syms=[...wsSubs].slice(0,8);
+  for(const s of syms){
+    try{
+      const url=new URL('https://finnhub.io/api/v1/quote');
+      url.searchParams.set('symbol',s);url.searchParams.set('token',key);
+      const r=await fetch(url.toString(),{method:'GET',mode:'cors',credentials:'omit'});
+      if(!r.ok) continue;
+      const q=await r.json();
+      if(q&&q.c&&q.c>0) handleTrade({s,p:q.c});
+    }catch(e){}
+  }
 }
-function wsSend(obj){try{ws?.readyState===1&&ws.send(JSON.stringify(obj));}catch(e){}}
-function wsSub(s){wsSubs.add(s);wsSend({type:'subscribe',symbol:s});}
+function _startPricePolling(){
+  if(_pollActive) return;
+  const key=localStorage.getItem('apex_fh_key');
+  if(!key) return;
+  _pollActive=true;
+  document.getElementById('ws-status')?.classList.replace('ws-off','ws-on');
+  setTimeout(_pollOnce,3000);
+  _pollInterval=setInterval(_pollOnce,15000);
+}
 function handleTrade({s,p}){
   const prev=lastPrices.get(s);const dir=prev==null||p>=prev?'up':'dn';
   lastPrices.set(s,p);
@@ -2236,7 +2354,7 @@ async function buildTicker(){
     if(html&&inner)inner.innerHTML=html+html;
   };
   await Promise.allSettled(TICKER_SYMS.map((s,idx)=>
-    yfQuote(s).then(q=>{
+    smartQuote(s).then(q=>{
       if(!q?.c)return;
       tickItems[idx]=`<span class="tick" onclick="loadDDStock('${s}');showPage('deepdive')"><span class="sym">${s.replace('-USD','').replace('=F','')}</span><span>${fmtPrice(q.c,2)}</span><span class="chg ${pillCls(q.dp)}">${fmtPct(q.dp,1)}</span></span>`;
       if(!built){built=true;setTimeout(render,0);}
@@ -3008,6 +3126,11 @@ const INDEX_SYMS=[
 
 function buildDashboard(el){
   el.innerHTML=`
+  <!-- ═══════════════════════════════════════════════
+       SECTION 1 — HERO BANNER
+       210px height · sphere canvas · hero-grid · hero-glow
+       hero-content: title, subtitle, 3 hero stats
+  ═══════════════════════════════════════════════ -->
   <div class="hero" style="height:210px">
     <div class="hero-grid"></div>
     <div class="hero-glow"></div>
@@ -3017,14 +3140,27 @@ function buildDashboard(el){
       <h1>Market Overview</h1>
       <p>Live indices, sector performance, and macro signals in one view.</p>
       <div class="hero-stats" id="dash-stats">
-        <div class="hs"><div class="hs-label">S&P 500</div><div class="hs-val" id="hs-spy">—</div></div>
-        <div class="hs"><div class="hs-label">NASDAQ</div><div class="hs-val" id="hs-qqq">—</div></div>
-        <div class="hs"><div class="hs-label">VIX</div><div class="hs-val" id="hs-vix">—</div></div>
+        <div class="hs">
+          <div class="hs-label">S&amp;P 500</div>
+          <div class="hs-val" id="hs-spy">—</div>
+        </div>
+        <div class="hs">
+          <div class="hs-label">NASDAQ</div>
+          <div class="hs-val" id="hs-qqq">—</div>
+        </div>
+        <div class="hs">
+          <div class="hs-label">VIX</div>
+          <div class="hs-val" id="hs-vix">—</div>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- Index Cards -->
+  <!-- ═══════════════════════════════════════════════
+       SECTION 2 — INDEX CARDS ROW
+       g5 grid · 5 cards: SPY QQQ DIA IWM VIX
+       Each: symbol label · name label · price div · change div · spark canvas
+  ═══════════════════════════════════════════════ -->
   <div class="g5 mb20" id="idx-cards">
     ${INDEX_SYMS.map(s=>`
     <div class="card idx-card card-tilt" onclick="loadDDStock('${s.fh||s.sym}');showPage('deepdive')">
@@ -3032,107 +3168,207 @@ function buildDashboard(el){
       <div class="idx-name">${s.name}</div>
       <div class="idx-price" id="price-${s.fh||s.sym}">${skeletonEl('90px','24px')}</div>
       <div class="idx-chg" id="chg-${s.fh||s.sym}">${skeletonEl('80px','14px')}</div>
-      <canvas class="spark" id="spark-${s.fh||s.sym}"></canvas>
+      <canvas class="spark" id="spark-${s.fh||s.sym}" data-h="36"></canvas>
     </div>`).join('')}
   </div>
 
-  <!-- Fear & Greed + Breadth + Sector Heatmap -->
+  <!-- ═══════════════════════════════════════════════
+       SECTION 3 — MAIN CONTENT ROW
+       g-6238 grid · left column + right column
+       Left:  Sector Performance card (heatmap + refresh btn)
+              Market Breadth card (advancing / declining / unchanged in g3)
+       Right: Market Sentiment gauge card (SVG arc gauge + needle)
+              Commodities card (WTI · Brent · Gold · Silver · Nat Gas)
+  ═══════════════════════════════════════════════ -->
   <div class="g-6238 mb20">
+
+    <!-- LEFT COLUMN -->
     <div>
+
+      <!-- Sector Performance -->
       <div class="card card-p mb14">
         <div class="df aic jb mb14">
           <div>
             <div class="card-title">Sector Performance</div>
             <div style="font-size:10px;color:var(--t4);margin-top:2px" id="sect-upd">—</div>
           </div>
-          <div style="display:flex;gap:6px;align-items:center">
+          <div class="df aic" style="gap:6px">
             <button class="btn btn-ghost btn-sm" onclick="loadSectorHeatmap()">↺</button>
           </div>
         </div>
-        <div id="heatmap"><div style="color:var(--t3);font-size:12px">Loading sector data...</div></div>
-      </div>
-      <!-- Market Breadth — Fix 1.12 -->
-      <div class="card card-p">
-        <div class="card-title mb14">Market Breadth <span style="font-size:9px;color:var(--t4)">(SPY-derived est.)</span></div>
-        <div class="g3">
-          <div class="tc"><div style="font-size:10px;color:var(--t3);margin-bottom:4px">Advancing</div><div class="f-mono" style="font-size:20px;font-weight:600" id="breadth-up">${skeletonEl('50px','22px')}</div></div>
-          <div class="tc"><div style="font-size:10px;color:var(--t3);margin-bottom:4px">Declining</div><div class="f-mono" style="font-size:20px;font-weight:600" id="breadth-dn">${skeletonEl('50px','22px')}</div></div>
-          <div class="tc"><div style="font-size:10px;color:var(--t3);margin-bottom:4px">Unchanged</div><div class="f-mono" style="font-size:20px;font-weight:600" id="breadth-nc">${skeletonEl('50px','22px')}</div></div>
+        <div id="heatmap">
+          <div class="skeleton" style="height:80px;border-radius:8px"></div>
         </div>
       </div>
-    </div>
+
+      <!-- Market Breadth -->
+      <div class="card card-p">
+        <div class="card-title mb14">Market Breadth
+          <span style="font-size:9px;color:var(--t4)">(SPY-derived est.)</span>
+        </div>
+        <div class="g3">
+          <div class="tc">
+            <div style="font-size:10px;color:var(--t3);margin-bottom:4px">Advancing</div>
+            <div class="f-mono" style="font-size:20px;font-weight:600" id="breadth-up">
+              ${skeletonEl('50px','22px')}
+            </div>
+          </div>
+          <div class="tc">
+            <div style="font-size:10px;color:var(--t3);margin-bottom:4px">Declining</div>
+            <div class="f-mono" style="font-size:20px;font-weight:600" id="breadth-dn">
+              ${skeletonEl('50px','22px')}
+            </div>
+          </div>
+          <div class="tc">
+            <div style="font-size:10px;color:var(--t3);margin-bottom:4px">Unchanged</div>
+            <div class="f-mono" style="font-size:20px;font-weight:600" id="breadth-nc">
+              ${skeletonEl('50px','22px')}
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /LEFT COLUMN -->
+
+    <!-- RIGHT COLUMN -->
     <div>
-      <!-- Fear & Greed — Fix 1.13 -->
+
+      <!-- Market Sentiment Gauge -->
       <div class="card card-p mb14">
         <div class="card-title mb4">Market Sentiment
           <span style="font-size:9px;color:var(--t4);font-weight:400;margin-left:4px">(VIX-Derived)</span>
-          <span title="Approximated from VIX. CNN Fear &amp; Greed index requires a separate data source." style="cursor:help;color:var(--t3);margin-left:3px">ⓘ</span>
+          <span title="Approximated from VIX. CNN Fear &amp; Greed index requires a separate data source."
+                style="cursor:help;color:var(--t3);margin-left:3px">ⓘ</span>
         </div>
         <div id="fg-wrap">
           <svg width="200" height="120" viewBox="0 0 200 120" style="display:block;margin:0 auto">
             <defs>
               <linearGradient id="gaugeFill" x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" stop-color="#E0768D"/>
-                <stop offset="50%" stop-color="#D4A96A"/>
+                <stop offset="0%"   stop-color="#E0768D"/>
+                <stop offset="50%"  stop-color="#D4A96A"/>
                 <stop offset="100%" stop-color="#5CC98A"/>
               </linearGradient>
             </defs>
-            <!-- Arc background -->
-            <path d="M20,100 A80,80 0 0,1 180,100" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="14" stroke-linecap="round"/>
-            <!-- Arc fill -->
-            <path id="fg-arc" d="M20,100 A80,80 0 0,1 180,100" fill="none" stroke="url(#gaugeFill)" stroke-width="14" stroke-linecap="round" stroke-dasharray="251" stroke-dashoffset="251"/>
+            <!-- Track arc -->
+            <path d="M20,100 A80,80 0 0,1 180,100"
+                  fill="none" stroke="rgba(255,255,255,0.06)"
+                  stroke-width="14" stroke-linecap="round"/>
+            <!-- Filled arc — animates via JS -->
+            <path id="fg-arc"
+                  d="M20,100 A80,80 0 0,1 180,100"
+                  fill="none" stroke="url(#gaugeFill)"
+                  stroke-width="14" stroke-linecap="round"
+                  stroke-dasharray="251" stroke-dashoffset="251"/>
             <!-- Needle -->
-            <line id="fg-needle" x1="100" y1="100" x2="100" y2="30" stroke="var(--t1)" stroke-width="2.5" stroke-linecap="round"/>
-            <circle cx="100" cy="100" r="5" fill="var(--bg3)" stroke="var(--t1)" stroke-width="1.5"/>
+            <line id="fg-needle"
+                  x1="100" y1="100" x2="100" y2="30"
+                  stroke="var(--t1)" stroke-width="2.5" stroke-linecap="round"/>
+            <circle cx="100" cy="100" r="5"
+                    fill="var(--bg3)" stroke="var(--t1)" stroke-width="1.5"/>
             <!-- Labels -->
-            <text x="15" y="118" font-family="'Outfit',sans-serif" font-size="9" fill="var(--rose)">FEAR</text>
+            <text x="15"  y="118" font-family="'Outfit',sans-serif" font-size="9" fill="var(--rose)">FEAR</text>
             <text x="165" y="118" font-family="'Outfit',sans-serif" font-size="9" fill="var(--green)">GREED</text>
           </svg>
           <div class="tc mt4">
-            <div class="f-serif" style="font-size:36px;line-height:1" id="fg-val">${skeletonEl('50px','36px')}</div>
-            <div style="font-size:11px;font-weight:700;font-family:'Outfit',sans-serif;letter-spacing:1px;margin-top:4px" id="fg-lbl">—</div>
+            <div class="f-serif" style="font-size:36px;line-height:1" id="fg-val">
+              ${skeletonEl('50px','36px')}
+            </div>
+            <div style="font-size:11px;font-weight:700;font-family:'Outfit',sans-serif;
+                        letter-spacing:1px;margin-top:4px" id="fg-lbl">—</div>
           </div>
         </div>
       </div>
-      <!-- Commodities strip (Fix 1.4) -->
+
+      <!-- Commodities -->
       <div class="card card-p">
         <div class="card-title mb12">Commodities</div>
         <div id="dash-commodities">
-          ${['🛢️ WTI Crude','🥇 Gold','🥈 Silver','⛽ Nat. Gas'].map(c=>`
-          <div class="stat-row"><span class="sl">${c}</span>${skeletonEl('80px','14px')}</div>`).join('')}
+          <div class="stat-row">
+            <span class="sl">🛢️ WTI Crude</span>
+            ${skeletonEl('80px','14px')}
+          </div>
+          <div class="stat-row">
+            <span class="sl">🛢️ Brent Crude</span>
+            ${skeletonEl('80px','14px')}
+          </div>
+          <div class="stat-row">
+            <span class="sl">🥇 Gold</span>
+            ${skeletonEl('80px','14px')}
+          </div>
+          <div class="stat-row">
+            <span class="sl">🥈 Silver</span>
+            ${skeletonEl('80px','14px')}
+          </div>
+          <div class="stat-row">
+            <span class="sl">⛽ Nat. Gas</span>
+            ${skeletonEl('80px','14px')}
+          </div>
         </div>
       </div>
-    </div>
-  </div>
 
-  <!-- Movers & Earnings -->
+    </div><!-- /RIGHT COLUMN -->
+
+  </div><!-- /SECTION 3 g-6238 -->
+
+  <!-- ═══════════════════════════════════════════════
+       SECTION 4 — MOVERS AND EARNINGS ROW
+       g2 grid
+       Left:  Top Movers card — 3 tabs + tbl with 3 tbody ids
+       Right: Earnings This Week card — g5 grid #earn-week
+  ═══════════════════════════════════════════════ -->
   <div class="g2 mb20">
+
+    <!-- Top Movers -->
     <div class="card">
       <div class="tabs" id="movers-tabs">
         <button class="tab active" onclick="switchMoversTab('gainers',this)">🚀 Top Gainers</button>
-        <button class="tab" onclick="switchMoversTab('losers',this)">📉 Top Losers</button>
-        <button class="tab" onclick="switchMoversTab('active',this)">🔥 Most Active</button>
+        <button class="tab"        onclick="switchMoversTab('losers',this)">📉 Top Losers</button>
+        <button class="tab"        onclick="switchMoversTab('active',this)">🔥 Most Active</button>
       </div>
-      <div class="ovx"><table class="tbl w-full">
-        <thead><tr><th style="padding-left:14px">Stock</th><th>Price</th><th>Change</th></tr></thead>
-        <tbody id="gainers-body"></tbody>
-        <tbody id="losers-body" style="display:none"></tbody>
-        <tbody id="active-body" style="display:none"></tbody>
-      </table></div>
+      <div class="ovx">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th style="padding-left:14px">Stock</th>
+              <th>Price</th>
+              <th>Change</th>
+            </tr>
+          </thead>
+          <tbody id="gainers-body"></tbody>
+          <tbody id="losers-body" style="display:none"></tbody>
+          <tbody id="active-body"  style="display:none"></tbody>
+        </table>
+      </div>
     </div>
+
+    <!-- Earnings This Week -->
     <div class="card card-p">
       <div class="df aic jb mb14">
         <span class="card-title">Earnings This Week</span>
-        <span style="font-size:10px;color:var(--t3)">${new Date().toLocaleDateString('en-US',{month:'short',day:'numeric'})}</span>
+        <span style="font-size:10px;color:var(--t3)">
+          ${new Date().toLocaleDateString('en-US',{month:'short',day:'numeric'})}
+        </span>
       </div>
-      <div id="earn-week" class="g5" style="gap:8px"></div>
+      <div id="earn-week" class="g5" style="gap:8px">
+        <div class="skeleton" style="height:80px;border-radius:8px"></div>
+        <div class="skeleton" style="height:80px;border-radius:8px"></div>
+        <div class="skeleton" style="height:80px;border-radius:8px"></div>
+        <div class="skeleton" style="height:80px;border-radius:8px"></div>
+        <div class="skeleton" style="height:80px;border-radius:8px"></div>
+      </div>
     </div>
-  </div>
 
-  <!-- Economic Events -->
-  <div class="card card-p">
+  </div><!-- /SECTION 4 g2 -->
+
+  <!-- ═══════════════════════════════════════════════
+       SECTION 5 — ECONOMIC CALENDAR
+       Full-width card · list div #eco-events
+  ═══════════════════════════════════════════════ -->
+  <div class="card card-p mb22">
     <div class="card-title mb12">Economic Calendar</div>
-    <div id="eco-events"></div>
+    <div id="eco-events">
+      <div class="skeleton" style="height:60px;border-radius:8px"></div>
+    </div>
   </div>
   `;
 
@@ -3163,7 +3399,7 @@ function switchMoversTab(tab,btn){
 async function loadIndexCards(){
   // Fetch all quotes in parallel for fast render
   const results = await Promise.allSettled(
-    INDEX_SYMS.map(s => yfQuote(s.yf||s.sym).then(q=>({s,q})))
+    INDEX_SYMS.map(s => smartQuote(s.yf||s.sym).then(q=>({s,q})))
   );
   for(const res of results){
     if(res.status!=='fulfilled'||!res.value?.q?.c) continue;
@@ -3183,7 +3419,7 @@ async function loadIndexCards(){
     const sc=document.getElementById('spark-'+(s.fh||s.sym));
     if(!sc)return;
     const q=results.find(r=>r.status==='fulfilled'&&r.value?.s===s)?.value?.q;
-    const data=await yfCandles(s.yf||s.sym,'5d','15m');
+    const data=await smartCandles(s.yf||s.sym,'5d','15m');
     if(data?.c?.length){
       await waitForLayout();
       drawSparkline(sc,data.c,(q?.dp||0)>=0);
@@ -3192,7 +3428,7 @@ async function loadIndexCards(){
 }
 
 async function loadFearGreed(){
-  const vixQ=await yfQuote('^VIX');if(!vixQ?.c)return;
+  const vixQ=await smartQuote('^VIX');if(!vixQ?.c)return;
   const vix=vixQ.c;
   // VIX → sentiment score: VIX 10=90, VIX 20=50, VIX 40=10
   const score=Math.max(5,Math.min(95,Math.round(100-(vix-10)*2.5)));
@@ -3213,7 +3449,7 @@ async function loadFearGreed(){
 }
 
 async function loadMarketBreadth(){
-  const spy=await yfQuote('SPY');if(!spy?.dp)return;
+  const spy=await smartQuote('SPY');if(!spy?.dp)return;
   // Fix 1.12: Estimate from SPY move, clearly labeled
   const total=500;
   const adv=Math.round(total*(0.5+spy.dp*0.04));
@@ -3445,10 +3681,10 @@ async function loadDDStock(sym){
   const inp=document.getElementById('dd-input');if(inp)inp.value=ddSym;
   const el=document.getElementById('dd-content');if(!el)return;
   el.innerHTML=`<div style="text-align:center;padding:40px;color:var(--t3)"><div style="width:28px;height:28px;border-radius:50%;border:3px solid var(--bg3);border-top-color:var(--mint);animation:spin 1s linear infinite;margin:0 auto 12px"></div>Loading ${ddSym}...</div>`;
-  const[q,prof,fin,recs,earns,news]=await Promise.all([getQuote(ddSym),getProfile(ddSym),getFinancials(ddSym),getRecs(ddSym),getEarnings(ddSym),getNews(ddSym)]);
+  const[q,prof,fin,recs,earns,news]=await Promise.all([smartQuote(ddSym),getProfile(ddSym),getFinancials(ddSym),getRecs(ddSym),getEarnings(ddSym),getNews(ddSym)]);
   if(!q?.c&&!prof?.name){
     // Try Yahoo Finance as fallback quote
-    const yfq=await yfQuote(ddSym);
+    const yfq=await smartQuote(ddSym);
     if(!yfq?.c){
       el.innerHTML=`<div class="empty"><div class="empty-icon">🔍</div><div style="font-size:13px">No data found for "${ddSym}".</div><div style="font-size:12px;color:var(--t3);margin-top:8px">Make sure you're using the ticker symbol (e.g. <strong>AAPL</strong> not "Apple").<br>Use the search box above and click a result from the dropdown.</div></div>`;
       return;
@@ -3528,7 +3764,7 @@ async function loadDDChart(tf,btn){
   loadCtx.font='12px "DM Sans",sans-serif';
   loadCtx.textAlign='center';
   loadCtx.fillText('Loading chart…',lW/2,130);
-  const data=await yfCandles(ddSym,range,interval);
+  const data=await smartCandles(ddSym,range,interval);
   // Double rAF ensures canvas has final layout dimensions
   await waitForLayout();
   // data is always non-null now (falls back to synthetic if network fails)
@@ -3909,7 +4145,7 @@ function renderWL(){
     <div class="f-mono" style="font-size:11px;color:var(--t3)" id="wlp-${s}">${skeletonEl('80px','12px')}</div></div>
     <button style="background:none;border:none;color:var(--t4);cursor:pointer;font-size:13px;padding:4px 8px" onclick="event.stopPropagation();removeWL('${s}')">✕</button>
   </div>`).join('');
-  syms.forEach(async s=>{const q=await getQuote(s);const e=document.getElementById('wlp-'+s);if(e&&q?.c){e.textContent='$'+fmtPrice(q.c)+' '+fmtPct(q.dp);e.style.color=q.dp>=0?'var(--green)':'var(--rose)';}});
+  syms.forEach(async s=>{const q=await smartQuote(s);const e=document.getElementById('wlp-'+s);if(e&&q?.c){e.textContent='$'+fmtPrice(q.c)+' '+fmtPct(q.dp);e.style.color=q.dp>=0?'var(--green)':'var(--rose)';}});
 }
 function switchWL(n,btn){
   activeWL=n;localStorage.setItem('apex_wl',n);
@@ -4243,7 +4479,7 @@ async function buildCrypto(el){
   `;
   const yfSymMap={BTC:'BTC-USD',ETH:'ETH-USD',SOL:'SOL-USD',BNB:'BNB-USD',XRP:'XRP-USD',DOGE:'DOGE-USD',ADA:'ADA-USD',AVAX:'AVAX-USD',LINK:'LINK-USD',DOT:'DOT-USD',LTC:'LTC-USD',UNI:'UNI-USD',ATOM:'ATOM-USD',XLM:'XLM-USD',SUI:'SUI-USD',NEAR:'NEAR-USD'};
   cryptoList.forEach(async([sym])=>{
-    const q=await yfQuote(yfSymMap[sym]||sym+'-USD');if(!q?.c)return;
+    const q=await smartQuote(yfSymMap[sym]||sym+'-USD');if(!q?.c)return;
     const pe=document.getElementById(`c-price-${sym}`);const ce=document.getElementById(`c-chg-${sym}`);
     if(pe)pe.textContent='$'+fmtPrice(q.c,q.c<1?6:q.c<100?4:2);
     if(ce){ce.textContent=fmtPct(q.dp);ce.className=`crypto-chg f-mono ${q.dp>=0?'t-green':'t-rose'}`;}
@@ -4261,7 +4497,7 @@ async function loadBTCChart(tf,btn){
   const c=document.getElementById('btc-chart');if(!c)return;
   const tfMap={'1D':['1d','5m'],'1W':['5d','1h'],'1M':['1mo','1d'],'1Y':['1y','1wk']};
   const[range,interval]=tfMap[tf]||['1d','5m'];
-  const data=await yfCandles('BTC-USD',range,interval);
+  const data=await smartCandles('BTC-USD',range,interval);
   c.style.height='200px';
   await waitForLayout();
   if(!data?.c?.length){
@@ -4276,7 +4512,7 @@ async function loadBTCChart(tf,btn){
 
 async function loadBTCSPYCorrelation(){
   const el=document.getElementById('btc-spy-corr');if(!el)return;
-  const[btcData,spyData]=await Promise.all([yfCandles('BTC-USD','1mo','1d'),yfCandles('SPY','1mo','1d')]);
+  const[btcData,spyData]=await Promise.all([smartCandles('BTC-USD','1mo','1d'),smartCandles('SPY','1mo','1d')]);
   if(!btcData?.c?.length||!spyData?.c?.length){el.textContent='—';return;}
   // Daily returns
   const btcRets=btcData.c.slice(1).map((v,i)=>(v-btcData.c[i])/btcData.c[i]);
@@ -4394,7 +4630,7 @@ async function runCompareChart(tf,btn){
   const c=document.getElementById('cmp-chart');if(!c)return;
   const tfMap={'1M':['1mo','1d'],'3M':['3mo','1d'],'6M':['6mo','1d'],'1Y':['1y','1wk'],'5Y':['5y','1mo']};
   const[range,interval]=tfMap[tf]||['1mo','1d'];
-  const allData=await Promise.allSettled(compareSyms.map(s=>yfCandles(s,range,interval).then(d=>({s,d}))));
+  const allData=await Promise.allSettled(compareSyms.map(s=>smartCandles(s,range,interval).then(d=>({s,d}))));
   const datasets=allData
     .filter(r=>r.status==='fulfilled'&&r.value?.d?.c?.length)
     .map(({value:{s,d}},i)=>({
